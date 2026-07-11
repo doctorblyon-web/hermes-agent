@@ -1377,8 +1377,48 @@ def _get_platform_tools(
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
 
-    platform_toolsets = config.get("platform_toolsets") or {}
+    raw_platform_toolsets = config.get("platform_toolsets")
+    if raw_platform_toolsets is None:
+        platform_toolsets = {}
+    elif isinstance(raw_platform_toolsets, dict):
+        platform_toolsets = raw_platform_toolsets
+    elif platform == "telegram":
+        # Telegram is an externally reachable authority boundary. A malformed
+        # per-platform map must not fall back to the broad platform defaults.
+        return set()
+    else:
+        # Preserve the historical non-Telegram expression exactly: falsy
+        # malformed values became {}, while truthy malformed values failed on
+        # the .get() below. Do not broaden or tighten those legacy semantics.
+        platform_toolsets = raw_platform_toolsets or {}
+
     toolset_names = platform_toolsets.get(platform)
+
+    # Telegram uses a strict allowlist whenever the operator has written an
+    # explicit platform entry. Unlike the legacy resolver below, this path
+    # does not recover non-configurable toolsets, auto-enable newly discovered
+    # plugins, add context-engine tools, or inherit globally enabled MCP
+    # servers. Any of those capabilities can still be enabled deliberately by
+    # naming its toolset/server in platform_toolsets.telegram.
+    if platform == "telegram" and platform in platform_toolsets:
+        if not isinstance(toolset_names, list):
+            # YAML null and other malformed values fail closed. A missing key
+            # (handled by the legacy path below) retains historical defaults;
+            # an explicit empty list intentionally enables nothing.
+            return set()
+        explicit = {
+            str(ts)
+            for ts in toolset_names
+            if str(ts) != "no_mcp"
+            and _toolset_allowed_for_platform(str(ts), platform)
+        }
+        agent_cfg = config.get("agent") or {}
+        if not isinstance(agent_cfg, dict):
+            agent_cfg = {}
+        disabled_toolsets = agent_cfg.get("disabled_toolsets") or []
+        if isinstance(disabled_toolsets, (list, tuple, set)):
+            explicit -= {str(ts) for ts in disabled_toolsets}
+        return explicit
 
     if toolset_names is None or not isinstance(toolset_names, list):
         plat_info = PLATFORMS.get(platform)
@@ -1541,8 +1581,21 @@ def _get_platform_tools(
     # has been saved for that platform (tracked via known_plugin_toolsets).
     # Unknown plugins default to enabled; known-but-absent = disabled.
     if plugin_ts_keys:
-        known_map = config.get("known_plugin_toolsets", {})
-        known_for_platform = set(known_map.get(platform, []))
+        if platform == "telegram":
+            known_map = config.get("known_plugin_toolsets") or {}
+            if not isinstance(known_map, dict):
+                known_map = {}
+            known_raw = known_map.get(platform)
+            known_for_platform = (
+                {str(ts) for ts in known_raw}
+                if isinstance(known_raw, (list, tuple, set))
+                else set()
+            )
+        else:
+            # Preserve the exact legacy behavior for every other platform,
+            # including its failures on malformed parent/child values.
+            known_map = config.get("known_plugin_toolsets", {})
+            known_for_platform = set(known_map.get(platform, []))
         for pts in plugin_ts_keys:
             if pts in toolset_names:
                 # Explicitly listed in config — enabled
