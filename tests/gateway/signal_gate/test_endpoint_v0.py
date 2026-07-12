@@ -12,10 +12,11 @@ ENDPOINT=ROOT/"deploy/signal_v0/m3/signal-set-endpoint"
 def canon(x): return json.dumps(x,sort_keys=True,separators=(",",":"),ensure_ascii=False)
 def sha(x): return hashlib.sha256(x.encode()).hexdigest()
 
-def staged(tmp_path):
+def staged(tmp_path,receipt_identity="$eid",alter_event_mtime=False):
     billos=tmp_path/"BillOS"; (billos/"events").mkdir(parents=True); (billos/"bin").mkdir(); (billos/"receipts/process-event").mkdir(parents=True); (billos/"state/signal").mkdir(parents=True)
     processor=billos/"bin/process-event"
-    processor.write_text("#!/bin/sh\neid=$2\necho state > '"+str(billos/"state/signal/current_signal.json")+"'\necho receipt > '"+str(billos/"receipts/process-event")+"/'$eid'.test.txt'\n")
+    touch=("/usr/bin/touch -t 200001010000 '"+str(billos/"events")+"/'$eid'.yml'\n") if alter_event_mtime else ""
+    processor.write_text("#!/bin/sh\neid=$2\necho mutation >> '"+str(billos/"mutation.log")+"'\necho state > '"+str(billos/"state/signal/current_signal.json")+"'\necho \"receipt: "+receipt_identity+"\" > '"+str(billos/"receipts/process-event")+"/'$eid'.test.txt'\n"+touch)
     processor.chmod(0o755)
     source=ENDPOINT.read_text().replace('/Users/billlyon/VaultHub/BillVault/Agent-Shared/BillOS',str(billos)).replace('/Users/billlyon/.local/state/billos-signal-endpoint/requests.sqlite',str(tmp_path/'requests.sqlite'))
     script=tmp_path/"endpoint"; script.write_text(source); script.chmod(0o755); return script,billos
@@ -32,6 +33,7 @@ def test_endpoint_applies_once_and_replays_identical_receipt(tmp_path):
     assert first.returncode == second.returncode == 0
     one,two=json.loads(first.stdout),json.loads(second.stdout)
     assert one == two and one["status"] == "APPLIED"
+    assert one["process_receipt"]["receipt_event_id"] == one["event_id"]
     assert len(list((billos/"events").glob("SIGNAL_SET-*.yml"))) == 1
 
 def test_endpoint_rejects_conflict_and_oversize(tmp_path):
@@ -41,6 +43,17 @@ def test_endpoint_rejects_conflict_and_oversize(tmp_path):
     huge=subprocess.run([str(script)],input="x"*9000,text=True,capture_output=True,timeout=4)
     assert json.loads(huge.stdout)["error"]["code"] == "request_too_large"
 
+def test_endpoint_rejects_mismatched_receipt_body_identity(tmp_path):
+    script,_=staged(tmp_path,"wrong-event")
+    assert json.loads(run(script,request()).stdout)["error"]["code"] == "receipt_identity"
+
+def test_event_created_at_comes_from_event_not_mtime(tmp_path):
+    script,billos=staged(tmp_path,alter_event_mtime=True); result=json.loads(run(script,request()).stdout)
+    event=next((billos/"events").glob("SIGNAL_SET-*.yml"))
+    assert event.stat().st_mtime < 1000000000
+    import yaml
+    assert result["event_created_at"] == yaml.safe_load(event.read_text())["timestamp"]
+
 def test_concurrent_same_request_has_one_event_and_one_receipt(tmp_path):
     script,billos=staged(tmp_path); req=request()
     with concurrent.futures.ThreadPoolExecutor(max_workers=4) as pool:
@@ -49,6 +62,7 @@ def test_concurrent_same_request_has_one_event_and_one_receipt(tmp_path):
     assert all(x == payloads[0] for x in payloads)
     assert len(list((billos/"events").glob("SIGNAL_SET-*.yml"))) == 1
     assert len(list((billos/"receipts/process-event").glob("*.txt"))) == 1
+    assert (billos/"mutation.log").read_text().splitlines() == ["mutation"]
 
 def test_forced_key_is_restrict_and_fixed_command():
     option=(ROOT/"deploy/signal_v0/authorized_keys.option").read_text()

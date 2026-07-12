@@ -3,8 +3,10 @@ import json
 import threading
 import time
 import uuid
+import sys
 from types import SimpleNamespace
 
+import pytest
 from gateway.signal_gate import m3_client, schema
 from gateway.signal_gate.store import Store
 
@@ -77,7 +79,7 @@ def test_indeterminate_recovery_and_no_processing_to_pending(tmp_path):
 
 def test_verified_m3_response_required():
     req={"request_id":"r","proposal_id":"p","proposal_sha256":"a"*64}
-    body={**req,"version":1,"status":"APPLIED","event_id":"e","event_type":"SIGNAL_SET","process_receipt":{"receipt_id":"x","receipt_sha256":"b"*64,"canonical_state_sha256":"c"*64}}
+    body={**req,"version":1,"status":"APPLIED","event_id":"e","event_type":"SIGNAL_SET","process_receipt":{"receipt_id":"e.x.txt","receipt_event_id":"e","receipt_sha256":"b"*64,"canonical_state_sha256":"c"*64}}
     body["response_sha256"]=m3_client.canonical_hash(body)
     assert m3_client.verify_response(body,req)["status"] == "APPLIED"
     body["proposal_id"]="wrong"
@@ -86,18 +88,64 @@ def test_verified_m3_response_required():
     else: raise AssertionError("unverified response accepted")
 
 
+def test_mismatched_receipt_body_identity_rejected():
+    req={"request_id":"r","proposal_id":"p","proposal_sha256":"a"*64}
+    body={**req,"version":1,"status":"APPLIED","event_id":"e","event_type":"SIGNAL_SET","process_receipt":{"receipt_id":"e.x.txt","receipt_event_id":"other","receipt_sha256":"b"*64,"canonical_state_sha256":"c"*64}}
+    body["response_sha256"]=m3_client.canonical_hash(body)
+    try: m3_client.verify_response(body,req)
+    except m3_client.M3Error as exc: assert str(exc) == "receipt_event_correlation"
+    else: raise AssertionError("mismatched receipt identity accepted")
+
+
 def test_query_not_in_ssh_argv(monkeypatch):
     captured={}
+    class Writer:
+        def write(self,body): captured["stdin"]=body
+        async def drain(self): pass
+        def close(self): pass
+    class Reader:
+        def __init__(self,data): self.data=data
+        async def read(self,n): data,self.data=self.data[:n],self.data[n:]; return data
     class Proc:
         returncode=0
-        async def communicate(self,body):
-            captured["stdin"]=body
-            req=json.loads(body); out={**{k:req[k] for k in ("request_id","proposal_id","proposal_sha256")},"version":1,"status":"REJECTED","applied":False,"error":{"code":"test","message":"test"}}
-            out["response_sha256"]=m3_client.canonical_hash(out)
-            return json.dumps(out).encode(),b""
-    async def create(*argv,**kwargs): captured["argv"]=argv; return Proc()
+        async def wait(self): return 0
+        def kill(self): pass
+    async def create(*argv,**kwargs):
+        captured["argv"]=argv
+        req={"request_id":"secret-request","proposal_id":"secret-proposal","proposal_sha256":"a"*64}
+        out={**req,"version":1,"status":"REJECTED","applied":False,"error":{"code":"test","message":"test"}}
+        out["response_sha256"]=m3_client.canonical_hash(out)
+        proc=Proc(); proc.stdin=Writer(); proc.stdout=Reader(json.dumps(out).encode()); proc.stderr=Reader(b""); return proc
     monkeypatch.setattr(asyncio,"create_subprocess_exec",create)
     req={"request_id":"secret-request","proposal_id":"secret-proposal","proposal_sha256":"a"*64,"signal":{"actions":[],"no_today":None}}
     asyncio.run(m3_client.call(req))
     assert "secret-request" not in " ".join(captured["argv"])
     assert b"secret-request" in captured["stdin"]
+
+
+def _request():
+    return {"request_id":"r","proposal_id":"p","proposal_sha256":"a"*64,"signal":{"actions":[],"no_today":None}}
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
+@pytest.mark.parametrize("stream,size",[("stdout",32769),("stderr",4097)])
+async def test_m3_client_hard_output_limits(monkeypatch,stream,size):
+    real=asyncio.create_subprocess_exec
+    async def create(*argv,**kwargs):
+        target="sys.stdout.buffer" if stream=="stdout" else "sys.stderr.buffer"
+        return await real(sys.executable,"-c",f"import sys; {target}.write(b'x'*{size})",**kwargs)
+    monkeypatch.setattr(asyncio,"create_subprocess_exec",create)
+    with pytest.raises(m3_client.M3Error,match="output_limit"):
+        await m3_client.call(_request())
+
+
+@pytest.mark.asyncio
+@pytest.mark.live_system_guard_bypass
+async def test_m3_client_total_timeout(monkeypatch):
+    real=asyncio.create_subprocess_exec
+    async def create(*argv,**kwargs):
+        return await real(sys.executable,"-c","import time; time.sleep(10)",**kwargs)
+    monkeypatch.setattr(asyncio,"create_subprocess_exec",create)
+    with pytest.raises(m3_client.M3Error,match="indeterminate_timeout"):
+        await m3_client.call(_request(),timeout=0.05)
