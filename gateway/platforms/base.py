@@ -491,6 +491,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.signal_gate import service as signal_gate
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -4636,15 +4637,29 @@ class BasePlatformAdapter(ABC):
 
                 # Send the text portion
                 if text_content and not _tts_caption_delivered:
+                    _signal_prepared = None
+                    try:
+                        _signal_prepared = signal_gate.prepare(
+                            self, event, text_content,
+                            has_attachments=bool(images or local_files or media_files or _tts_path or is_ephemeral_response or _ephemeral_ttl),
+                        )
+                    except Exception as exc:
+                        logger.error("[%s] governed SIGNAL rejected: %s", self.name, exc)
+                        text_content = "The SIGNAL proposal was not delivered because deterministic validation failed. Nothing was saved or applied."
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    if _signal_prepared:
+                        result = await self.send(chat_id=event.source.chat_id, content=text_content, reply_to=_reply_anchor, metadata=_final_thread_metadata)
+                    else:
+                        result = await self._send_with_retry(chat_id=event.source.chat_id, content=text_content, reply_to=_reply_anchor, metadata=_final_thread_metadata)
                     _record_delivery(result)
+                    if _signal_prepared and not signal_gate.finalize(_signal_prepared, result):
+                        _record_delivery(await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content="The SIGNAL proposal could not be armed for approval. Nothing was saved or applied.",
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        ))
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors

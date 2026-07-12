@@ -1,0 +1,1 @@
+restrict,no-port-forwarding,no-agent-forwarding,no-X11-forwarding,no-pty,command="/Users/billlyon/bin/signal-set-endpoint" <DEDICATED_PUBLIC_KEY>
