@@ -47,8 +47,6 @@ def prepare(adapter, event, text, *, has_attachments=False):
         return None
     if adapter.name != "telegram" or has_attachments:
         raise GovernedError("governed SIGNAL requires one text-only Telegram message")
-    if getattr(event.source, "chat_type", None) != "dm":
-        raise GovernedError("governed SIGNAL requires a private Telegram chat")
     if str(event.source.user_id) != str(cfg.get("bill_user_id")) or str(event.source.chat_id) != str(cfg.get("chat_id")):
         raise GovernedError("governed SIGNAL is restricted to the configured private lane")
     canonical = schema.canonical_json(proposal)
@@ -93,24 +91,7 @@ async def _apply(adapter, store, txn, request, reply_to):
         return
     if response["status"] == "APPLIED":
         receipt = response["process_receipt"]
-        try:
-            committed = store.applied(txn.id, response["event_id"], receipt["receipt_sha256"])
-        except Exception as exc:
-            logger.error("SIGNAL local APPLIED persistence failed: %s", exc)
-            committed = False
-        if not committed:
-            try:
-                current = store.get(txn.id)
-            except Exception:
-                current = None
-            if current and current.state == "APPLIED":
-                return
-            try:
-                store.indeterminate(txn.id, "local_applied_persistence")
-            except Exception:
-                pass
-            await adapter.send(txn.chat_id, "M3 returned a verified receipt, but Williams could not durably record APPLIED. The request remains indeterminate and no ordinary APPLIED success is being announced.", reply_to=reply_to)
-            return
+        store.applied(txn.id, response["event_id"], receipt["receipt_sha256"])
         await adapter.send(txn.chat_id, f"Applied canonically on M3. SIGNAL event {response['event_id']} was processed and receipt {receipt['receipt_id']} was verified.", reply_to=reply_to)
     else:
         code = (response.get("error") or {}).get("code", "m3_rejected")
@@ -139,9 +120,6 @@ async def intercept(adapter, event):
     cfg = settings()
     if not cfg.get("enabled") or str(event.source.user_id) != str(cfg.get("bill_user_id")) or str(event.source.chat_id) != str(cfg.get("chat_id")):
         return False
-    if getattr(event.source, "chat_type", None) != "dm":
-        await adapter.send(event.source.chat_id, "SIGNAL approval is restricted to Bill's configured private Telegram chat. Nothing was applied.", reply_to=event.message_id)
-        return True
     await reconcile(adapter)
     store = _store(cfg)
     if event.platform_update_id is None or store.update_seen(event.platform_update_id):
