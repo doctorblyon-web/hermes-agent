@@ -1,5 +1,0 @@
-gateway:
-  signal_gate:
-    enabled: false
-    bill_user_id: "<REDACTED_TELEGRAM_NUMERIC_ID>"
-    chat_id: "<REDACTED_PRIVATE_CHAT_ID>"
