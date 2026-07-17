@@ -369,6 +369,8 @@ AUTHOR_MAP = {
     "dirtyren@users.noreply.github.com": "dirtyren",
     "s96919@gmail.com": "s96919",
     "rasitakyol@hotmail.com": "rasitakyol",
+    "dr@nevernet.com": "davidrobertson",
+    "eva@100yen.org": "100yenadmin",
     "yakimenkoleksander228@gmail.com": "doxe0x",
     "a54983334@163.com": "Code-suphub",
     "78542984+Code-suphub@users.noreply.github.com": "Code-suphub",
