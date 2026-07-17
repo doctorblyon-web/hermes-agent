@@ -79,7 +79,7 @@ def parse_display(text: str):
         raise ValidationError("top_level_keys")
     if raw["no_today"] is not None:
         raise ValidationError("no_today_must_be_null")
-    if not isinstance(raw["actions"], list) or len(raw["actions"]) != 3:
+    if not isinstance(raw["actions"], list) or not 1 <= len(raw["actions"]) <= 3:
         raise ValidationError("action_count")
     actions = []
     for i, item in enumerate(raw["actions"]):
