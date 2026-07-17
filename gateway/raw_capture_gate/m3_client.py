@@ -29,6 +29,11 @@ RECEIPT_KEYS = {
     "request_id", "capture_id", "content_sha256", "canonical_state_sha256",
     "applied_by", "processed_at", "updated_by", "receipt_recovered",
 }
+# The typed capture shape adds object_type to the applied response and its
+# receipt. These sets stay exact: a typed response missing object_type is
+# rejected, and a legacy response carrying it is rejected just as firmly.
+APPLIED_KEYS_TYPED = APPLIED_KEYS | {"object_type"}
+RECEIPT_KEYS_TYPED = RECEIPT_KEYS | {"object_type"}
 FAILURE_KEYS = {"version", "request_id", "status", "applied", "error", "response_sha256"}
 
 
@@ -55,9 +60,14 @@ def verify_response(response, request):
         raise M3Error("response_hash")
     if response.get("version") != 1 or response.get("request_id") != request.get("request_id"):
         raise M3Error("request_correlation")
+    # The request we sent decides which shape the response must take.
+    requested_type = (request.get("capture") or {}).get("object_type")
+    typed = "object_type" in (request.get("capture") or {})
     if response.get("status") == "APPLIED":
-        if set(response) != APPLIED_KEYS:
+        if set(response) != (APPLIED_KEYS_TYPED if typed else APPLIED_KEYS):
             raise M3Error("applied_schema")
+        if typed and response.get("object_type") != requested_type:
+            raise M3Error("object_type_correlation")
         event_id, capture_id = response.get("event_id"), response.get("capture_id")
         if not isinstance(event_id, str) or EVENT_ID_RE.fullmatch(event_id) is None:
             raise M3Error("event_id")
@@ -71,8 +81,12 @@ def verify_response(response, request):
         if response.get("content_sha256") != expected_content:
             raise M3Error("content_correlation")
         receipt = response.get("process_receipt")
-        if not isinstance(receipt, dict) or set(receipt) != RECEIPT_KEYS:
+        if not isinstance(receipt, dict) or set(receipt) != (
+            RECEIPT_KEYS_TYPED if typed else RECEIPT_KEYS
+        ):
             raise M3Error("receipt_schema")
+        if typed and receipt.get("object_type") != requested_type:
+            raise M3Error("receipt_object_type_correlation")
         if receipt["receipt_event_id"] != event_id:
             raise M3Error("receipt_event_correlation")
         if not isinstance(receipt["receipt_id"], str) or re.fullmatch(

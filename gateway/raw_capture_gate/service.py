@@ -27,6 +27,7 @@ class CaptureResult:
     receipt_sha256: str
     source_update_id: str
     source_message_id: str
+    object_type: str | None = None
 
 
 def settings():
@@ -98,22 +99,39 @@ async def reconcile_inflight(
     return len(rows)
 
 
+def _capture_payload(parsed):
+    """Build the capture object for either accepted M3 shape.
+
+    ``object_type`` is omitted entirely — never emitted as null — when the
+    capture is untyped, so legacy request bytes, the content hash and the
+    replay identity below stay byte-for-byte as they are today.
+    """
+    payload = {
+        "original_text": parsed.original_text,
+        "content_sha256": schema.content_sha256(parsed.original_text),
+        "triage_state": parsed.triage_state,
+        "triage_reason": parsed.triage_reason,
+    }
+    if parsed.object_type is not None:
+        payload["object_type"] = parsed.object_type
+    return payload
+
+
+def _source_payload(event, captured_at):
+    return {
+        "platform": "telegram",
+        "user_id": str(event.source.user_id),
+        "chat_id": str(event.source.chat_id),
+        "update_id": str(event.platform_update_id),
+        "message_id": str(event.message_id),
+        "captured_at": captured_at,
+    }
+
+
 def _request_hash(event, parsed, captured_at):
     identity = {
-        "source": {
-            "platform": "telegram",
-            "user_id": str(event.source.user_id),
-            "chat_id": str(event.source.chat_id),
-            "update_id": str(event.platform_update_id),
-            "message_id": str(event.message_id),
-            "captured_at": captured_at,
-        },
-        "capture": {
-            "original_text": parsed.original_text,
-            "content_sha256": schema.content_sha256(parsed.original_text),
-            "triage_state": parsed.triage_state,
-            "triage_reason": parsed.triage_reason,
-        },
+        "source": _source_payload(event, captured_at),
+        "capture": _capture_payload(parsed),
     }
     return hashlib.sha256(_canonical(identity).encode("utf-8")).hexdigest()
 
@@ -123,20 +141,8 @@ def _build_request(request_id, event, parsed, captured_at):
         "version": 1,
         "operation": "RAW_CAPTURE_APPEND",
         "request_id": request_id,
-        "source": {
-            "platform": "telegram",
-            "user_id": str(event.source.user_id),
-            "chat_id": str(event.source.chat_id),
-            "update_id": str(event.platform_update_id),
-            "message_id": str(event.message_id),
-            "captured_at": captured_at,
-        },
-        "capture": {
-            "original_text": parsed.original_text,
-            "content_sha256": schema.content_sha256(parsed.original_text),
-            "triage_state": parsed.triage_state,
-            "triage_reason": parsed.triage_reason,
-        },
+        "source": _source_payload(event, captured_at),
+        "capture": _capture_payload(parsed),
     }
 
 
@@ -218,6 +224,7 @@ async def _capture(event, parsed, *, structured=False):
                 receipt_sha256=receipt["receipt_sha256"],
                 source_update_id=str(event.platform_update_id),
                 source_message_id=str(event.message_id),
+                object_type=response.get("object_type"),
             )
         return (
             f"Captured canonically on M3 as {response['capture_id']}. "
@@ -243,10 +250,14 @@ async def capture_text(event, text):
     return await _capture(event, parsed)
 
 
-async def capture_result(event, text):
-    """Return verified capture provenance for a deterministic internal route."""
+async def capture_result(event, text, *, object_type=None):
+    """Return verified capture provenance for a deterministic internal route.
+
+    Passing ``object_type`` selects M3's typed capture shape; the verified
+    response must echo that same type back or m3_client rejects it.
+    """
     try:
-        parsed = schema.validate_text(text)
+        parsed = schema.validate_text(text, object_type=object_type)
     except schema.CaptureError:
         return None
     result = await _capture(event, parsed, structured=True)

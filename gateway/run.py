@@ -7436,6 +7436,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _capture_response is not None:
                 return _capture_response
 
+        # Explicit natural thought capture: deterministic intent match, then
+        # the existing Raw Capture path with M3's typed capture shape. It runs
+        # before model dispatch so capture never depends on model compliance or
+        # prior conversation. Anything that is not an explicit thought request
+        # returns None here and keeps its baseline route.
+        if not is_internal and not _raw_capture_text.startswith("/"):
+            try:
+                from gateway.thoughts_gate import service as _thoughts_gate
+
+                _thought_response = await _thoughts_gate.intercept(event)
+            except Exception as _thought_exc:
+                # Never break ordinary conversation, and never claim a save.
+                logger.exception("Thought capture failed: %s", _thought_exc)
+                _thought_response = None
+            if _thought_response is not None:
+                return _thought_response
+
         # Bill-lane natural PA intake interprets ordinary language into a
         # closed set of typed actions, then lets bounded handlers mutate state.
         if not is_internal and not _raw_capture_text.startswith("/"):
