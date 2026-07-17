@@ -43,7 +43,7 @@ class Store:
               display_sha256 TEXT NOT NULL, proposal_sha256 TEXT NOT NULL, proposal_json TEXT NOT NULL,
               approval_update_id TEXT, approval_message_id TEXT, request_id TEXT UNIQUE,
               request_json TEXT,
-              m3_event_id TEXT, receipt_sha256 TEXT, error_code TEXT,
+              m3_event_id TEXT, receipt_sha256 TEXT, error_code TEXT, error_detail TEXT,
               CHECK(state IN ('PREPARED','PENDING','PROCESSING','INDETERMINATE','APPLIED','FAILED','DELIVERY_FAILED','EXPIRED','SUPERSEDED')));
             CREATE INDEX IF NOT EXISTS proposal_lane ON proposal(bill_user_id,chat_id,state,created_at);
             CREATE TABLE IF NOT EXISTS telegram_update(update_id TEXT PRIMARY KEY, proposal_id TEXT NOT NULL, consumed_at REAL NOT NULL);
@@ -56,6 +56,12 @@ class Store:
               proposal_id TEXT UNIQUE
             );
             """)
+            # Additive, idempotent migration for pre-existing databases: retain
+            # M3's rejection detail alongside the existing error_code without
+            # altering any prior column or row.
+            columns = {row["name"] for row in db.execute("PRAGMA table_info(proposal)")}
+            if "error_detail" not in columns:
+                db.execute("ALTER TABLE proposal ADD COLUMN error_detail TEXT")
 
     def connect(self):
         db = sqlite3.connect(self.path, timeout=10, isolation_level=None)
@@ -247,9 +253,9 @@ class Store:
                 return True
         return False
 
-    def rejected(self, pid, code):
+    def rejected(self, pid, code, detail=None):
         for source in ("PROCESSING", "INDETERMINATE"):
-            if self.transition(pid, source, "FAILED", error_code=code):
+            if self.transition(pid, source, "FAILED", error_code=code, error_detail=detail):
                 return True
         return False
 

@@ -295,9 +295,22 @@ async def _apply(adapter, store, txn, request, reply_to):
             reply_to=reply_to,
         )
     else:
-        code = (response.get("error") or {}).get("code", "m3_rejected")
-        store.rejected(txn.id, code)
-        await adapter.send(txn.chat_id, f"M3 rejected the SIGNAL request ({code}). Nothing was applied.", reply_to=reply_to)
+        error = response.get("error") or {}
+        code = error.get("code", "m3_rejected")
+        detail = error.get("message")
+        # Retain M3's exact rejection code and message in the durable SIGNAL
+        # transaction and the local audit log for diagnosis. The user-facing
+        # reply stays plain and free of codes, IDs, JSON, hashes and receipts.
+        logger.error(
+            "SIGNAL rejected by M3 (proposal %s): code=%s detail=%s",
+            txn.id, code, detail,
+        )
+        store.rejected(txn.id, code, detail)
+        if store.today_goals(txn.id):
+            message = "I couldn’t update today’s goals. Nothing was changed."
+        else:
+            message = "I couldn’t apply that on M3. Nothing was changed."
+        await adapter.send(txn.chat_id, message, reply_to=reply_to)
 
 
 async def reconcile(adapter, *, all_inflight=False):
