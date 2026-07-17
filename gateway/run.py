@@ -2107,6 +2107,15 @@ def _platform_config_key(platform: "Platform") -> str:
     return "cli" if platform == Platform.LOCAL else platform.value
 
 
+def _signal_streaming_holdback_required(source: Any, config: dict) -> bool:
+    from gateway.signal_gate.service import is_governed_lane
+    return is_governed_lane(source, config)
+
+
+def _apply_signal_streaming_holdback(enabled: bool, source: Any, config: dict) -> bool:
+    return bool(enabled and not _signal_streaming_holdback_required(source, config))
+
+
 def _teams_pipeline_plugin_enabled() -> bool:
     """Return True when the standalone Teams pipeline plugin is enabled."""
     config = _load_gateway_config()
@@ -5498,6 +5507,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 "plugin discovery failed at gateway startup", exc_info=True,
             )
 
+        # Reconcile a bounded raw-capture batch without delaying gateway startup
+        # or recreating Telegram outcome messages.
+        try:
+            from gateway.raw_capture_gate import service as _raw_capture_gate
+            asyncio.create_task(_raw_capture_gate.reconcile_inflight())
+        except Exception:
+            logger.warning("raw capture startup reconciliation could not be scheduled", exc_info=True)
+
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
         # direct/single-tenant deployments are unaffected. When configured, the
@@ -7382,6 +7399,57 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Record rate limit so subsequent messages are silently ignored
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
+
+        # Ticket 01 raw capture is an explicit, deterministic Telegram lane.
+        # It runs after normal authorization and before command/model dispatch;
+        # unmatched messages retain the baseline route unchanged.
+        _raw_capture_text = event.text if isinstance(event.text, str) else ""
+
+        # One exact Bill-lane command: deterministic parse, durable source
+        # capture, then the existing governed SIGNAL approval path.
+        if not is_internal:
+            try:
+                from gateway.signal_gate import service as _signal_gate
+
+                _goals_response = await _signal_gate.intercept_today_goals(event)
+            except Exception as _goals_exc:
+                logger.exception("Today's goals interception failed: %s", _goals_exc)
+                _goals_response = "I couldn’t safely prepare today’s goals, so nothing was changed."
+            if _goals_response is not None:
+                return _goals_response
+
+        _is_raw_capture_command = (
+            _raw_capture_text.startswith("/capture ")
+            or _raw_capture_text.startswith("/capture_needs_triage ")
+        )
+        if not is_internal and _is_raw_capture_command:
+            try:
+                from gateway.raw_capture_gate import service as _raw_capture_gate
+
+                _capture_response = await _raw_capture_gate.intercept(event)
+            except Exception as _capture_exc:
+                logger.exception("Raw capture interception failed: %s", _capture_exc)
+                _capture_response = (
+                    "Raw capture handling failed after an unknown boundary. "
+                    "The outcome is indeterminate and no success or failure is being claimed."
+                )
+            if _capture_response is not None:
+                return _capture_response
+
+        # Bill-lane natural PA intake interprets ordinary language into a
+        # closed set of typed actions, then lets bounded handlers mutate state.
+        if not is_internal and not _raw_capture_text.startswith("/"):
+            try:
+                from gateway.natural_pa_intake import service as _natural_pa
+
+                _pa_response = await _natural_pa.intercept(event)
+            except Exception as _pa_exc:
+                logger.exception("Natural PA intake failed: %s", _pa_exc)
+                _pa_response = (
+                    "I could not verify the requested PA actions, so nothing is being claimed as complete."
+                )
+            if _pa_response is not None:
+                return _pa_response
         
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -14169,6 +14237,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _plat_streaming is None
             else bool(_plat_streaming)
         )
+        _streaming_enabled = _apply_signal_streaming_holdback(
+            _streaming_enabled, source, user_config
+        )
 
         _thread_metadata: Optional[Dict[str, Any]] = self._thread_metadata_for_source(source, event_message_id)
 
@@ -15334,9 +15405,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _plat_streaming is None
                 else bool(_plat_streaming)
             )
+            _streaming_enabled = _apply_signal_streaming_holdback(
+                _streaming_enabled, source, user_config
+            )
             _want_stream_deltas = _streaming_enabled
             _want_interim_messages = interim_assistant_messages_enabled
-            _want_interim_consumer = _want_interim_messages
+            _want_interim_consumer = (
+                _want_interim_messages
+                and not _signal_streaming_holdback_required(source, user_config)
+            )
             if _want_stream_deltas or _want_interim_consumer:
                 try:
                     from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig

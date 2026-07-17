@@ -1,0 +1,7 @@
+name: dashboard_status
+version: 1.0.0
+description: "Bounded read-only projection of the existing M3 BillOS dashboard state."
+author: Bill Lyon
+kind: standalone
+provides_tools:
+  - dashboard_status

@@ -66,6 +66,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[3]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.signal_gate import service as signal_gate
 from gateway.platforms.base import (
     BasePlatformAdapter,
     MessageEvent,
@@ -2429,6 +2430,10 @@ class TelegramAdapter(BasePlatformAdapter):
                     "[%s] DM topics setup failed (non-fatal): %s",
                     self.name, topics_err, exc_info=True,
                 )
+
+            # Reconcile any approval whose M3 outcome was interrupted by a
+            # prior gateway crash before accepting new Telegram updates.
+            await signal_gate.reconcile(self, all_inflight=True)
 
             return True
             
@@ -6170,6 +6175,8 @@ class TelegramAdapter(BasePlatformAdapter):
         event.text = self._clean_bot_trigger_text(event.text)
         await self._cache_replied_media(msg, event)
         event = self._apply_telegram_group_observe_attribution(event)
+        if await signal_gate.intercept(self, event):
+            return
         self._enqueue_text_event(event)
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:

@@ -491,6 +491,7 @@ from pathlib import Path as _Path
 sys.path.insert(0, str(_Path(__file__).resolve().parents[2]))
 
 from gateway.config import Platform, PlatformConfig
+from gateway.signal_gate import service as signal_gate
 from gateway.session import SessionSource, build_session_key
 from hermes_constants import get_default_hermes_root, get_hermes_dir, get_hermes_home
 
@@ -4584,6 +4585,26 @@ class BasePlatformAdapter(ABC):
                 # thread-strict.
                 _final_thread_metadata = _mark_notify_metadata(_thread_metadata)
 
+                # Governed SIGNAL output must be fully validated and durably
+                # prepared before any user-visible final delivery path runs.
+                _signal_prepared = None
+                _signal_rejected = False
+                if text_content:
+                    try:
+                        _signal_prepared = signal_gate.prepare(
+                            self, event, text_content,
+                            has_attachments=bool(images or local_files or media_files or is_ephemeral_response or _ephemeral_ttl),
+                        )
+                    except Exception as exc:
+                        logger.error("[%s] governed SIGNAL rejected: %s", self.name, exc)
+                        _signal_rejected = True
+                        text_content = "The SIGNAL proposal was not delivered because deterministic validation failed. Nothing was saved or applied."
+                        images = []
+                        local_files = []
+                        media_files = []
+                    if _signal_prepared:
+                        text_content = _signal_prepared.display_text
+
                 # Auto-TTS: if voice message, generate audio FIRST (before sending text)
                 # Gated via ``_should_auto_tts_for_chat``: fires when the chat has
                 # an explicit ``/voice on|tts`` opt-in OR when ``voice.auto_tts`` is
@@ -4592,7 +4613,9 @@ class BasePlatformAdapter(ABC):
                 if (self._should_auto_tts_for_chat(event.source.chat_id)
                         and event.message_type == MessageType.VOICE
                         and text_content
-                        and not media_files):
+                        and not media_files
+                        and not _signal_rejected
+                        and _signal_prepared is None):
                     try:
                         from tools.tts_tool import text_to_speech_tool, check_tts_requirements
                         if check_tts_requirements():
@@ -4638,13 +4661,18 @@ class BasePlatformAdapter(ABC):
                 if text_content and not _tts_caption_delivered:
                     logger.info("[%s] Sending response (%d chars) to %s", self.name, len(text_content), event.source.chat_id)
                     _reply_anchor = _reply_anchor_for_event(event)
-                    result = await self._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    if _signal_prepared:
+                        result = await self.send(chat_id=event.source.chat_id, content=text_content, reply_to=_reply_anchor, metadata=_final_thread_metadata)
+                    else:
+                        result = await self._send_with_retry(chat_id=event.source.chat_id, content=text_content, reply_to=_reply_anchor, metadata=_final_thread_metadata)
                     _record_delivery(result)
+                    if _signal_prepared and not signal_gate.finalize(_signal_prepared, result):
+                        _record_delivery(await self._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content="The SIGNAL proposal could not be armed for approval. Nothing was saved or applied.",
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        ))
 
                     # Schedule auto-deletion of system-notice replies.
                     # Detached so the handler returns immediately; errors
