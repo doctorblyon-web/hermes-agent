@@ -132,5 +132,31 @@ def render_display(proposal: Proposal) -> str:
     )
 
 
+_COUNT_WORD = {1: "one", 2: "two", 3: "three"}
+
+
+def render_human(proposal: Proposal) -> str:
+    """Telegram-facing goals presentation.
+
+    Never emits raw JSON, ```signal envelopes, hashes, IDs, receipt internals,
+    or literal-Y instructions — only the human-readable proposed goals and a
+    plain natural question.
+    """
+    n = len(proposal.actions)
+    count = _COUNT_WORD.get(n, str(n))
+    noun = "goal" if n == 1 else "goals"
+    header = f"I have {count} {noun} for today:"
+    body = "\n".join(
+        f"{index}. {action['text']}"
+        for index, action in enumerate(proposal.actions, 1)
+    )
+    question = (
+        "Replace today’s current goals with these?"
+        if proposal.replacement
+        else "Set today’s goals to these?"
+    )
+    return f"{header}\n\n{body}\n\n{question}"
+
+
 def sha256(value: str) -> str:
     return hashlib.sha256(value.encode()).hexdigest()

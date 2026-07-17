@@ -12,9 +12,11 @@ import sqlite3
 from gateway.signal_gate import service
 from gateway.signal_gate.store import Store
 
+# Both goals and plain SIGNAL failures now report the same plain goals message;
+# success reports the required plain confirmation.
 GOALS_REJECT_TEXT = "I couldn’t update today’s goals. Nothing was changed."
-PLAIN_REJECT_TEXT = "I couldn’t apply that on M3. Nothing was changed."
-GOALS_SUCCESS_TEXT = "Done — today’s goals are set."
+PLAIN_REJECT_TEXT = "I couldn’t update today’s goals. Nothing was changed."
+GOALS_SUCCESS_TEXT = "Done. Today’s goals are updated."
 
 
 class FakeAdapter:

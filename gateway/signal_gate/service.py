@@ -18,6 +18,43 @@ logger = logging.getLogger(__name__)
 TODAY_GOALS_PREFIX = "Set today’s goals:"
 _LIST_MARKER = re.compile(r"^[ \t]*(?:\d+[.)]|[-•])[ \t]*")
 
+# Natural approval / rejection vocabulary for the goals confirmation reply.
+# Matched case-insensitively with surrounding whitespace and trailing
+# punctuation tolerated; only used to approve/reject a single pending proposal.
+_AFFIRM = frozenset({
+    "y", "yes", "yes please", "yep", "yeah", "yup", "ya", "yes do it",
+    "confirm", "confirmed", "confirm please", "do that", "do it", "go ahead",
+    "correct", "ok", "okay", "sure", "please do", "affirmative", "approved",
+})
+_REJECT = frozenset({
+    "n", "no", "nope", "no thanks", "no thank you", "cancel", "cancelled",
+    "leave them", "leave it", "leave them as they are", "keep them",
+    "keep it", "keep the current goals", "keep current goals",
+    "keep the current", "keep the current ones", "dont change them",
+    "do not change them", "dont change", "dont change it", "no dont",
+})
+_AMBIGUOUS = frozenset({
+    "maybe", "not sure", "unsure", "idk", "i dont know", "hmm", "perhaps",
+    "i guess", "dunno", "possibly", "not yet", "hold on", "wait", "later",
+})
+
+
+def _classify_reply(text):
+    if not isinstance(text, str):
+        return "other"
+    # Normalise for tolerant matching: lowercase, drop apostrophes, treat any
+    # punctuation as a separator, and collapse surrounding/internal whitespace.
+    normalized = text.strip().lower().replace("’", "'").replace("'", "")
+    normalized = re.sub(r"[.,!?;:]+", " ", normalized)
+    normalized = re.sub(r"\s+", " ", normalized).strip()
+    if normalized in _AFFIRM:
+        return "affirm"
+    if normalized in _REJECT:
+        return "reject"
+    if normalized in _AMBIGUOUS:
+        return "ambiguous"
+    return "other"
+
 
 class GovernedError(RuntimeError):
     pass
@@ -172,7 +209,7 @@ async def intercept_today_goals(event):
     proposal = schema.Proposal(
         proposal.actions, replacement=state["has_goals"], today_goals=True,
     )
-    return schema.render_display(proposal)
+    return schema.render_human(proposal)
 
 
 def prepare(adapter, event, text, *, has_attachments=False):
@@ -206,7 +243,7 @@ def prepare(adapter, event, text, *, has_attachments=False):
     if str(event.source.user_id) != str(cfg.get("bill_user_id")) or str(event.source.chat_id) != str(cfg.get("chat_id")):
         raise GovernedError("governed SIGNAL is restricted to the configured private lane")
     canonical = schema.canonical_json(proposal)
-    display_text = schema.render_display(proposal)
+    display_text = schema.render_human(proposal)
     store = _store(cfg)
     kwargs = {
         "bill_user_id": event.source.user_id,
@@ -290,8 +327,7 @@ async def _apply(adapter, store, txn, request, reply_to):
             return
         await adapter.send(
             txn.chat_id,
-            "Done — today’s goals are set." if store.today_goals(txn.id) else
-            "Applied canonically on M3. The verified SIGNAL receipt was recorded.",
+            "Done. Today’s goals are updated.",
             reply_to=reply_to,
         )
     else:
@@ -306,11 +342,11 @@ async def _apply(adapter, store, txn, request, reply_to):
             txn.id, code, detail,
         )
         store.rejected(txn.id, code, detail)
-        if store.today_goals(txn.id):
-            message = "I couldn’t update today’s goals. Nothing was changed."
-        else:
-            message = "I couldn’t apply that on M3. Nothing was changed."
-        await adapter.send(txn.chat_id, message, reply_to=reply_to)
+        await adapter.send(
+            txn.chat_id,
+            "I couldn’t update today’s goals. Nothing was changed.",
+            reply_to=reply_to,
+        )
 
 
 async def reconcile(adapter, *, all_inflight=False):
@@ -329,29 +365,71 @@ async def reconcile(adapter, *, all_inflight=False):
 
 
 async def intercept(adapter, event):
-    if event.text not in ("Y", "y"):
-        return False
     cfg = settings()
-    if not cfg.get("enabled") or str(event.source.user_id) != str(cfg.get("bill_user_id")) or str(event.source.chat_id) != str(cfg.get("chat_id")):
+    if (
+        not cfg.get("enabled")
+        or str(getattr(event.source, "user_id", None)) != str(cfg.get("bill_user_id"))
+        or str(getattr(event.source, "chat_id", None)) != str(cfg.get("chat_id"))
+    ):
+        return False
+
+    kind = _classify_reply(getattr(event, "text", None))
+    if kind == "other":
+        # Not a confirmation reply — ordinary conversation always falls through.
         return False
     if getattr(event.source, "chat_type", None) != "dm":
-        await adapter.send(event.source.chat_id, "SIGNAL approval is restricted to Bill's configured private Telegram chat. Nothing was applied.", reply_to=event.message_id)
-        return True
-    await reconcile(adapter)
+        # Confirmations are lane-restricted; do not act, let it fall through.
+        return False
+
     store = _store(cfg)
-    if event.platform_update_id is None or store.update_seen(event.platform_update_id):
-        await adapter.send(event.source.chat_id, "That Telegram approval update was invalid or already consumed. Nothing was applied.", reply_to=event.message_id)
-        return True
+    # Recover any interrupted approval before evaluating what is pending.
+    await reconcile(adapter)
     eligible = store.eligible(event.source.user_id, event.source.chat_id)
     if len(eligible) != 1:
-        store.consume_unbound(event.platform_update_id)
-        await adapter.send(event.source.chat_id, "No single unexpired SIGNAL proposal was available. Nothing was applied.", reply_to=event.message_id)
-        return True
+        # No single pending goals proposal. A bare yes/no/maybe here approves
+        # nothing, so fall through to ordinary conversation rather than hijack
+        # it or claim a change.
+        return False
     txn = eligible[0]
+
+    if kind == "ambiguous":
+        # Something is pending but the reply is unclear: briefly ask, commit
+        # nothing, and do not consume the proposal.
+        await adapter.send(
+            event.source.chat_id,
+            "Do you want me to replace today’s goals? Just say yes or no.",
+            reply_to=event.message_id,
+        )
+        return True
+
+    # Replay / duplicate protection: an already-consumed update never re-acts.
+    if event.platform_update_id is None or store.update_seen(event.platform_update_id):
+        await adapter.send(
+            event.source.chat_id,
+            "That reply was already handled. Nothing was changed.",
+            reply_to=event.message_id,
+        )
+        return True
+
+    if kind == "reject":
+        store.consume_unbound(event.platform_update_id)
+        store.supersede(txn.id)
+        await adapter.send(
+            event.source.chat_id,
+            "Kept your current goals. Nothing was changed.",
+            reply_to=event.message_id,
+        )
+        return True
+
+    # kind == "affirm": run the existing durable claim + M3 application path.
     request_id = str(uuid.uuid4())
     request = _request(txn, event, request_id, store)
     if not store.claim(txn.id, event.platform_update_id, event.message_id, request_id, json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False), event.reply_to_message_id):
-        await adapter.send(event.source.chat_id, "That approval was invalid or already consumed. Nothing was applied.", reply_to=event.message_id)
+        await adapter.send(
+            event.source.chat_id,
+            "That reply was already handled. Nothing was changed.",
+            reply_to=event.message_id,
+        )
         return True
     await _apply(adapter, store, store.get(txn.id), request, event.message_id)
     return True

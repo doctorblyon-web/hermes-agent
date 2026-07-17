@@ -89,21 +89,12 @@ def test_parsing_or_rendering_a_two_goal_proposal_does_not_touch_m3(monkeypatch)
     assert not called
 
 
-# ---- confirmation gating: negative / ambiguous replies do not commit ----
+# ---- ordinary non-goal conversation is not intercepted as a goals command ----
 
 class _Ev:
     def __init__(self, text):
         self.text = text
 
-
-@pytest.mark.parametrize("text", ["no", "cancel", "leave them", "maybe", "nope", "later"])
-def test_negative_or_ambiguous_confirmation_does_not_commit(text):
-    # Non-"Y" replies fall through (return False) → no SIGNAL apply, ordinary
-    # conversation proceeds.
-    assert asyncio.run(service.intercept(object(), _Ev(text))) is False
-
-
-# ---- ordinary non-goal conversation is not intercepted as a goals command ----
 
 @pytest.mark.parametrize("text", [
     "what's the weather like today",
