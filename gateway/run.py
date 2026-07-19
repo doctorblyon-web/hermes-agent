@@ -5515,6 +5515,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         except Exception:
             logger.warning("raw capture startup reconciliation could not be scheduled", exc_info=True)
 
+        # Reliable reminders (candidate): rebuild local one-shot scheduler jobs
+        # from canonical M3 on startup so a Williams/Christine restart re-arms
+        # every still-scheduled reminder exactly once. Inert unless the gate is
+        # enabled; never delays startup.
+        try:
+            from gateway.reminders import service as _reminders_service
+            if _reminders_service.settings().get("enabled"):
+                asyncio.create_task(_reminders_service.reconcile(all_inflight=True))
+        except Exception:
+            logger.warning("reminder startup reconciliation could not be scheduled", exc_info=True)
+
         # Register the generic relay adapter when a connector relay URL is
         # configured (GATEWAY_RELAY_URL / gateway.relay_url). No URL -> no-op, so
         # direct/single-tenant deployments are unaffected. When configured, the
@@ -7452,6 +7463,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _thought_response = None
             if _thought_response is not None:
                 return _thought_response
+
+        # Reliable reminders (candidate). Natural reminder creation, viewing,
+        # changing, snoozing and cancellation plus their yes/no confirmations,
+        # all M3-first. Inert unless gateway.reminders_gate.enabled is true; any
+        # failure returns None so ordinary conversation is never broken and no
+        # success is ever claimed.
+        if not is_internal and not _raw_capture_text.startswith("/"):
+            try:
+                from gateway.reminders import service as _reminders
+
+                _reminder_response = await _reminders.intercept(event)
+            except Exception as _reminder_exc:
+                logger.exception("Reminder handling failed: %s", _reminder_exc)
+                _reminder_response = None
+            if _reminder_response is not None:
+                return _reminder_response
 
         # Bill-lane natural PA intake interprets ordinary language into a
         # closed set of typed actions, then lets bounded handlers mutate state.

@@ -135,6 +135,14 @@ dependencies = [
   # Hence the ``sys_platform == 'win32'`` marker: the dep (and its portalocker
   # / pywin32 tree) ships only where it's actually used.
   "concurrent-log-handler==0.9.29; sys_platform == 'win32'",
+  # Natural-language reminder time resolution (reliable-reminders feature).
+  # dateparser turns "in two minutes" / "tomorrow at 9am" into an absolute,
+  # timezone-aware datetime resolved explicitly in Australia/Sydney (never the
+  # host timezone). Exact-pinned per the supply-chain policy above; BSD-3-Clause.
+  # Pure-Python wheel; its transitive deps (python-dateutil, pytz, regex,
+  # tzlocal) are already present or pure-Python. We do NOT rely on tzlocal's host
+  # lookup — the zone is passed explicitly at every call site.
+  "dateparser==1.4.1",
 ]
 
 [project.optional-dependencies]
