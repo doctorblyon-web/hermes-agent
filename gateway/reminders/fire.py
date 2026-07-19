@@ -19,6 +19,7 @@ fakes — no real scheduler, no real Telegram send, no real canonical write.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import logging
 import uuid
@@ -32,6 +33,12 @@ logger = logging.getLogger(__name__)
 OUTCOME_DELIVERED = "delivered"
 OUTCOME_FAILED = "failed"
 OUTCOME_UNCERTAIN = "uncertain"
+
+
+class _TelegramUncertain(Exception):
+    """Ambiguous delivery result (network/timeout): the message may or may not
+    have been sent, so the outcome is recorded as ``uncertain`` — never
+    ``delivered``. Carries only a bounded, credential-free reason code."""
 
 
 @dataclass
@@ -105,11 +112,22 @@ async def fire_async(reminder_id: str, deps: Deps) -> str:
     target = json.loads(execution.target_json)
 
     try:
-        ok, error = deps.deliver(target, text)
-    except Exception as exc:
-        logger.error("reminder %s: delivery raised: %s", reminder_id, exc)
-        ok, error = False, f"exception:{exc}"
-        outcome = OUTCOME_UNCERTAIN
+        # deliver may be sync (test fakes) or a coroutine (the live async send);
+        # await it so the live path runs on the existing loop rather than nesting
+        # asyncio.run() inside it.
+        res = deps.deliver(target, text)
+        if inspect.isawaitable(res):
+            res = await res
+        ok, error = res
+    except _TelegramUncertain as exc:
+        # Ambiguous send (network/timeout): record uncertain, never delivered.
+        logger.warning("reminder %s: ambiguous delivery -> uncertain (%s)", reminder_id, exc)
+        ok, error, outcome = False, str(exc)[:64], OUTCOME_UNCERTAIN
+    except Exception:
+        # Never log the raw exception text — a send-layer error can echo the bot
+        # token inside its api.telegram.org/bot<TOKEN>/... URL.
+        logger.error("reminder %s: delivery raised unexpectedly", reminder_id)
+        ok, error, outcome = False, "delivery_exception", OUTCOME_UNCERTAIN
     else:
         outcome = OUTCOME_DELIVERED if ok else OUTCOME_FAILED
 
@@ -136,38 +154,95 @@ def _find(reminders, reminder_id):
 
 # --- default (live) wiring ---------------------------------------------------
 
-def _default_deliver(target: dict, text: str) -> tuple:
-    """Reuse the exact Telegram send the cron scheduler uses. Returns (ok, error).
+def _bot_token() -> Optional[str]:
+    """Load Christine's Telegram bot credential at fire time via the established
+    Hermes loader ``hermes_cli.config.get_env_value`` (os.environ, then the
+    durable ``~/.hermes/.env``).
 
-    Same call the scheduler makes at ``cron/scheduler.py`` delivery:
-    ``_send_to_platform(Platform, pconfig, chat_id, text, thread_id=...)`` with
-    ``pconfig`` sourced from ``load_gateway_config().platforms`` (config.yaml, so
-    the token survives a sanitized subprocess env)."""
+    The cron ``no_agent`` subprocess env is passed through
+    ``_sanitize_subprocess_env``, which strips ``TELEGRAM_BOT_TOKEN`` — so at
+    fire time it is re-read here from the durable ``.env``. We do NOT widen the
+    sanitizer; the credential stays in this short-lived process only and is never
+    written to job metadata, the command line, jobs.json, M3, logs or stdout."""
+    try:
+        from hermes_cli.config import get_env_value
+    except Exception:
+        return None
+    tok = get_env_value("TELEGRAM_BOT_TOKEN")
+    tok = tok.strip() if isinstance(tok, str) else None
+    return tok or None
+
+
+def _classify_send_error(exc) -> str:
+    """Map a send-layer exception to a bounded, credential-free reason code.
+
+    A Telegram exception's own text can echo the bot token inside its
+    api.telegram.org/bot<TOKEN>/... URL, so the raw text is NEVER propagated —
+    only these fixed codes are returned/recorded/logged."""
+    name = type(exc).__name__
+    if any(k in name for k in ("TimedOut", "NetworkError", "RetryAfter", "Conflict")):
+        return "network_or_timeout"
+    if any(k in name for k in ("BadRequest", "Forbidden", "Unauthorized", "InvalidToken", "ChatMigrated")):
+        return "telegram_rejected"
+    return "send_error"
+
+
+async def _default_deliver(target: dict, text: str) -> tuple:
+    """Deliver a reminder through the existing Telegram send primitive.
+
+    Awaited on the fire loop (never nests ``asyncio.run``). Returns
+    ``(True, None)`` on delivery, or ``(False, <bounded code>)`` for a definite
+    failure (recorded ``failed``). An ambiguous result (network/timeout) raises
+    :class:`_TelegramUncertain` (recorded ``uncertain``). A missing credential
+    returns ``(False, "missing_credential")`` and sends nothing. No credential
+    value is ever returned, logged, raised or recorded."""
+    token = _bot_token()
+    if not token:
+        # Honest, definite failure: cannot authenticate, so nothing is sent and
+        # 'delivered' is never claimed.
+        return False, "missing_credential"
+
     try:
         from gateway.config import Platform, load_gateway_config
         from tools.send_message_tool import _send_to_platform
-    except Exception as exc:  # pragma: no cover - environment wiring
-        return False, f"send_import:{exc}"
+    except Exception:
+        return False, "send_import_error"
 
     platform_name = (target.get("platform") or "telegram").lower()
-    chat_id = target.get("chat_id")
-    thread_id = target.get("thread_id")
     try:
         platform = Platform(platform_name)
     except Exception:
-        return False, f"unknown_platform:{platform_name}"
+        return False, "unknown_platform"
+
+    pconfig = load_gateway_config().platforms.get(platform)
+    if not pconfig:
+        return False, "platform_not_configured"
+
+    # Supply the credential to the existing send primitive ONLY within this
+    # short-lived fire subprocess: the Telegram adapter reads
+    # ``pconfig.token or os.getenv("TELEGRAM_BOT_TOKEN")`` at send time. Prefer
+    # setting it on the freshly-loaded pconfig; fall back to a process-local env
+    # var. Neither widens ``_sanitize_subprocess_env``.
+    import os
+    try:
+        setattr(pconfig, "token", token)
+    except Exception:
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
+    if not getattr(pconfig, "token", None):
+        os.environ["TELEGRAM_BOT_TOKEN"] = token
 
     try:
-        pconfig = load_gateway_config().platforms.get(platform)
-        if not pconfig:
-            return False, "platform_not_configured"
-        result = asyncio.run(_send_to_platform(platform, pconfig, str(chat_id), text, thread_id=thread_id))
+        result = await _send_to_platform(platform, pconfig, str(target.get("chat_id")), text,
+                                          thread_id=target.get("thread_id"))
     except Exception as exc:  # pragma: no cover - network path
-        return False, f"send_error:{exc}"
+        code = _classify_send_error(exc)
+        if code == "network_or_timeout":
+            raise _TelegramUncertain(code)   # ambiguous -> uncertain
+        return False, code                    # definite rejection -> failed
     ok = getattr(result, "success", None)
     if ok is None:
         ok = bool(result)
-    return bool(ok), None if ok else "delivery_failed"
+    return (True, None) if ok else (False, "delivery_rejected")
 
 
 def _default_deps() -> Deps:
