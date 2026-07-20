@@ -7480,6 +7480,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _reminder_response is not None:
                 return _reminder_response
 
+        # Canonical PA objects (candidate): natural obligation / needs_bill
+        # creation and their explicit status transitions, all M3-first. Inert
+        # unless gateway.pa_objects_gate.enabled is true; any failure returns None
+        # so ordinary conversation is never broken and no success is ever claimed.
+        if not is_internal and not _raw_capture_text.startswith("/"):
+            try:
+                from gateway.pa_objects import service as _pa_objects
+
+                _pa_object_response = await _pa_objects.intercept(event)
+            except Exception as _pa_object_exc:
+                logger.exception("PA object handling failed: %s", _pa_object_exc)
+                _pa_object_response = None
+            if _pa_object_response is not None:
+                return _pa_object_response
+
         # Bill-lane natural PA intake interprets ordinary language into a
         # closed set of typed actions, then lets bounded handlers mutate state.
         if not is_internal and not _raw_capture_text.startswith("/"):
