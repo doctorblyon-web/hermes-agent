@@ -1,10 +1,16 @@
-"""PA object orchestration — recognise, resolve target, apply M3-first, confirm.
+"""PA object orchestration — the bounded write behind Christine's model tool.
 
-Runs on the Christine plane. Ordinary conversation always falls through: only an
-explicit obligation/decision statement or an explicit transition command is ever
-handled here. Every canonical effect is M3-first; Williams claims success only on
-a verified canonical receipt. A replayed Telegram update never creates or
-transitions a second object (local update-id ledger + M3 request idempotency).
+Christine's AI model owns the conversation: it interprets intent, asks natural
+clarifying questions over as many turns as it needs, and only then decides to
+record something. The functions here are the bounded canonical write it calls
+through the ``pa_object`` tool — they do NOT interpret ordinary conversation and
+are never run before the model. Every canonical effect is M3-first; success is
+claimed only on a verified canonical receipt; a repeated identical write is
+idempotent (content-keyed local ledger + M3 request ledger); there is no delete.
+
+``tool_create`` / ``tool_transition`` are the model-facing entry points. The
+older ``intercept`` remains only as the shared, well-tested write pipeline and is
+no longer wired to run before the model.
 
 Collaborator ``m3`` is injected so tests exercise the whole pipeline against a
 fake with no real SSH round-trip.
@@ -14,6 +20,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import uuid
 from datetime import datetime
 from pathlib import Path
@@ -277,3 +284,164 @@ async def _apply(store, event, request, kind, action, *, m3):
     reply = _confirm(obj["kind"], response.get("action", action), obj)
     store.applied(update_id, obj["object_id"], reply)
     return reply
+
+
+# =============================================================================
+# Model-facing tool API. Christine's model calls these AFTER it has understood
+# the request (conversing/clarifying first as needed). Structured arguments only
+# — no natural-language interpretation happens here.
+# =============================================================================
+
+_ISO_DATE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+
+def _resolve_due(due):
+    """Return YYYY-MM-DD or None. Accepts an explicit date or a natural phrase
+    ('Friday', 'tomorrow night'), resolved in Australia/Sydney. Never invents."""
+    if due is None or (isinstance(due, str) and not due.strip()):
+        return None
+    if isinstance(due, str) and _ISO_DATE.match(due.strip()):
+        try:
+            datetime.strptime(due.strip(), "%Y-%m-%d")
+            return due.strip()
+        except ValueError:
+            return None
+    d = parse.resolve_due_date(str(due))
+    return d.isoformat() if d else None
+
+
+def _tool_provenance(cfg, session_id, idem):
+    """Provenance for a model-tool write: Bill's configured lane plus a stable,
+    session-scoped id. Honest traceability; not a real inbound Telegram update."""
+    sid = (session_id or "na")[:48]
+    return {
+        "telegram_update_id": f"tool-{sid}-{idem[:12]}",
+        "telegram_user_id": str(cfg.get("bill_user_id") or "bill"),
+        "telegram_chat_id": str(cfg.get("chat_id") or "bill"),
+        "source_message_id": f"tool-{sid}",
+    }
+
+
+async def _apply_tool(cfg, idem, request, kind, action, *, m3):
+    """Shared M3-first apply for a tool write, idempotent on the content key."""
+    store = _store(cfg)
+    content_sha = _content_sha(request)
+    request_json = json.dumps(request, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+    txn, identical = store.begin(
+        update_id=idem, request_id=request["request_id"],
+        request_sha256=content_sha, request_json=request_json, kind=kind, action=action,
+    )
+    if not identical:
+        return {"ok": False, "message": "A different write is already recorded for that exact request."}
+    if txn.state == "APPLIED":
+        return {"ok": True, "already": True, "object_id": txn.object_id, "message": txn.reply_text}
+    send = json.loads(txn.request_json)
+    try:
+        response = await m3.call(send)
+    except Exception as exc:
+        logger.error("pa_object tool %s/%s indeterminate: %s", kind, action, exc)
+        store.indeterminate(idem, "transport_or_verification")
+        return {"ok": False, "message": INDETERMINATE_MSG}
+    if response.get("status") != "APPLIED":
+        error = response.get("error") or {}
+        store.failed(idem, error.get("code", "m3_rejected"))
+        return {"ok": False, "message": "I couldn't record that on M3. Nothing was changed.",
+                "error": error.get("code", "m3_rejected")}
+    obj = response["object"]
+    reply = _confirm(obj["kind"], response.get("action", action), obj)
+    store.applied(idem, obj["object_id"], reply)
+    return {"ok": True, "object_id": obj["object_id"], "kind": obj["kind"],
+            "status": obj["status"], "object_version": obj["object_version"], "message": reply}
+
+
+async def tool_create(kind, wording, *, person=None, due=None, project=None,
+                      session_id=None, m3=m3_client):
+    cfg = settings()
+    if cfg.get("enabled") is not True:
+        return {"ok": False, "message": "PA objects are not enabled."}
+    if kind not in schema.KINDS:
+        return {"ok": False, "message": f"Unknown object kind {kind!r}."}
+    try:
+        w = schema.preserve_wording(wording)
+    except schema.ValidationError:
+        return {"ok": False, "message": "I need the wording before I can record it."}
+    try:
+        if kind == "obligation":
+            obj = {
+                "wording": w, "content_sha256": schema.sha256(w),
+                "person": schema.clean_field(person, "person"),
+                "due_date": _resolve_due(due),
+                "project": schema.clean_field(project, "project"),
+                "provenance": None,
+            }
+        else:
+            obj = {"wording": w, "content_sha256": schema.sha256(w), "provenance": None}
+    except schema.ValidationError:
+        return {"ok": False, "message": "One of the details wasn't usable; nothing was recorded."}
+    idem = schema.sha256(schema.canonical_json(
+        {"k": kind, "a": "create", "w": w, "p": obj.get("person"),
+         "d": obj.get("due_date"), "pr": obj.get("project"), "s": session_id}))
+    obj["provenance"] = _tool_provenance(cfg, session_id, idem)
+    request = m3_client.build_create(
+        request_id=str(uuid.uuid4()), kind=kind, obj=obj,
+        approval=m3_client.approval_block(_now_sydney_rfc3339()))
+    return await _apply_tool(cfg, idem, request, kind, "create", m3=m3)
+
+
+async def tool_transition(kind, action, *, reference=None, object_id=None,
+                          decision=None, session_id=None, m3=m3_client):
+    cfg = settings()
+    if cfg.get("enabled") is not True:
+        return {"ok": False, "message": "PA objects are not enabled."}
+    if action not in schema.TRANSITIONS.get(kind, {}):
+        return {"ok": False, "message": f"Unsupported action {action!r} for {kind}."}
+    try:
+        target = await _resolve_tool_target(kind, action, reference, object_id, m3=m3)
+    except m3_client.M3Error:
+        return {"ok": False, "message": "I couldn't reach your items just now. Please try again."}
+    if target == "none":
+        noun = "obligation" if kind == "obligation" else "decision"
+        return {"ok": False, "message": f"I couldn't find an open {noun} matching that."}
+    if target == "many":
+        noun = "obligation" if kind == "obligation" else "decision"
+        return {"ok": False, "message": f"More than one {noun} could match — which one?"}
+    if target == "ineligible":
+        return {"ok": False, "message": "That item isn't in a state this change applies to."}
+    obj = {"object_id": target["object_id"], "base_version": target["object_version"]}
+    if action == "resolve":
+        d = schema.clean_field(decision, "decision")
+        if not d:
+            return {"ok": False, "message": "What's the decision? I need it to resolve this."}
+        obj["decision"] = d
+    idem = schema.sha256(schema.canonical_json(
+        {"k": kind, "a": action, "id": obj["object_id"], "v": obj["base_version"],
+         "dec": obj.get("decision"), "s": session_id}))
+    request = m3_client.build_transition(
+        request_id=str(uuid.uuid4()), kind=kind, action=action, obj=obj,
+        approval=m3_client.approval_block(_now_sydney_rfc3339()))
+    return await _apply_tool(cfg, idem, request, kind, action, m3=m3)
+
+
+async def _resolve_tool_target(kind, action, reference, object_id, *, m3):
+    eligible_from = schema.ELIGIBLE_FROM[(kind, action)]
+    if object_id is not None:
+        listing = await m3.call(m3.build_list(request_id=str(uuid.uuid4()), kind=kind, object_id=object_id))
+        objs = listing.get("objects", [])
+        if not objs:
+            return "none"
+        return objs[0] if objs[0].get("status") in eligible_from else "ineligible"
+    listing = await m3.call(m3.build_list(request_id=str(uuid.uuid4()), kind=kind))
+    candidates = [o for o in listing.get("objects", []) if o.get("status") in eligible_from]
+    ref = (reference or "").lower().strip()
+    if ref:
+        candidates = [
+            o for o in candidates
+            if (o.get("person") or "").lower() == ref
+            or ref in (o.get("wording") or "").lower()
+            or ref in (o.get("person") or "").lower()
+        ]
+    if not candidates:
+        return "none"
+    if len(candidates) > 1:
+        return "many"
+    return candidates[0]

@@ -185,6 +185,17 @@ TOOLSETS = {
         "tools": ["cronjob"],
         "includes": []
     },
+
+    "pa_object": {
+        "description": (
+            "Christine's bounded canonical PA-object write: record or transition "
+            "an obligation or a needs_bill decision on the M3 substrate. The model "
+            "converses and clarifies first, then calls this tool only when meaning "
+            "is clear. Gated on gateway.pa_objects_gate.enabled."
+        ),
+        "tools": ["pa_object"],
+        "includes": []
+    },
     
 
     "file": {

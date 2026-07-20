@@ -153,3 +153,101 @@ def test_ordinary_conversation_falls_through(wired):
     for i, text in enumerate(["How are you?", "yes", "I think that's fine", "thanks!"]):
         assert run(service.intercept(event(text, update=80 + i), m3=m3)) is None
     assert not m3.records
+
+
+# =============================================================================
+# Model-facing tool API (tool_create / tool_transition). These are what the
+# `pa_object` model tool calls AFTER Christine's model has understood the
+# request through conversation. Structured arguments only; no NL interpretation.
+# =============================================================================
+
+def test_tool_create_obligation_resolves_natural_due(wired):
+    m3 = wired
+    r = run(service.tool_create(
+        "obligation", "send Gina the revised material by Friday",
+        person="Gina", due="Friday", session_id="s1", m3=m3))
+    assert r["ok"] is True and "obligation" in r["message"].lower()
+    body = next(iter(m3.records.values()))[-1]
+    assert body["kind"] == "obligation" and body["status"] == "open"
+    assert body["wording"] == "send Gina the revised material by Friday"  # verbatim
+    assert body["person"] == "Gina" and body["due_date"] is not None       # resolved, not invented
+
+
+def test_tool_create_needs_bill(wired):
+    m3 = wired
+    r = run(service.tool_create(
+        "needs_bill", "whether to start the Composio pilot", session_id="s2", m3=m3))
+    assert r["ok"] is True and "decision" in r["message"].lower()
+    body = next(iter(m3.records.values()))[-1]
+    assert body["kind"] == "needs_bill" and body["decision"] is None       # not invented
+
+
+def test_tool_create_bare_obligation_invents_nothing(wired):
+    m3 = wired
+    r = run(service.tool_create("obligation", "call the accountant", session_id="s3", m3=m3))
+    assert r["ok"] is True
+    body = next(iter(m3.records.values()))[-1]
+    assert body["person"] is None and body["due_date"] is None and body["project"] is None
+
+
+def test_tool_create_is_idempotent_within_session(wired):
+    m3 = wired
+    a = run(service.tool_create("obligation", "email Sam the deck", session_id="dup", m3=m3))
+    upserts_a = sum(1 for c in m3.calls if c.get("operation") == "PA_OBJECT_UPSERT")
+    b = run(service.tool_create("obligation", "email Sam the deck", session_id="dup", m3=m3))
+    upserts_b = sum(1 for c in m3.calls if c.get("operation") == "PA_OBJECT_UPSERT")
+    assert a["object_id"] == b["object_id"]
+    assert b.get("already") is True
+    assert len(m3.records) == 1                 # exactly one canonical object
+    assert upserts_b == upserts_a               # replay made no new canonical write
+
+
+def test_tool_transition_complete_by_reference(wired):
+    m3 = wired
+    run(service.tool_create("obligation", "send Gina the material", person="Gina", session_id="c", m3=m3))
+    oid = next(iter(m3.records))
+    r = run(service.tool_transition("obligation", "complete", reference="Gina", session_id="t", m3=m3))
+    assert r["ok"] is True and m3.records[oid][-1]["status"] == "completed"
+
+
+def test_tool_transition_resolve_requires_decision_and_preserves_it(wired):
+    m3 = wired
+    run(service.tool_create("needs_bill", "whether to start the pilot", session_id="c", m3=m3))
+    # no decision -> refused, nothing changed
+    r0 = run(service.tool_transition("needs_bill", "resolve", reference="pilot", session_id="t0", m3=m3))
+    assert r0["ok"] is False
+    oid = next(iter(m3.records))
+    assert m3.records[oid][-1]["status"] == "open"
+    # with a verbatim decision -> resolved, decision preserved
+    r1 = run(service.tool_transition(
+        "needs_bill", "resolve", reference="pilot",
+        decision="do not start it yet", session_id="t1", m3=m3))
+    assert r1["ok"] is True
+    head = m3.records[oid][-1]
+    assert head["status"] == "resolved" and head["decision"] == "do not start it yet"
+
+
+def test_tool_transition_ambiguous_reference_asks_not_writes(wired):
+    m3 = wired
+    run(service.tool_create("obligation", "call the plumber", session_id="a", m3=m3))
+    run(service.tool_create("obligation", "call the electrician", session_id="b", m3=m3))
+    r = run(service.tool_transition("obligation", "complete", reference="call", session_id="t", m3=m3))
+    assert r["ok"] is False and ("which" in r["message"].lower() or "more than one" in r["message"].lower())
+    # both still open — nothing was changed on an ambiguous target
+    assert all(v[-1]["status"] == "open" for v in m3.records.values())
+
+
+def test_tool_transition_unknown_reference_changes_nothing(wired):
+    m3 = wired
+    run(service.tool_create("obligation", "water the plants", session_id="a", m3=m3))
+    r = run(service.tool_transition("obligation", "complete", reference="taxes", session_id="t", m3=m3))
+    assert r["ok"] is False
+    assert all(v[-1]["status"] == "open" for v in m3.records.values())
+
+
+def test_tool_create_gate_disabled_refuses(tmp_path, monkeypatch):
+    from tests.gateway.pa_object_helpers import cfg as _cfg
+    monkeypatch.setattr(service, "settings", lambda: _cfg(tmp_path, enabled=False))
+    m3 = FakeM3()
+    r = run(service.tool_create("obligation", "do a thing", session_id="s", m3=m3))
+    assert r["ok"] is False and not m3.records

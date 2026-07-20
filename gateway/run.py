@@ -7480,20 +7480,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if _reminder_response is not None:
                 return _reminder_response
 
-        # Canonical PA objects (candidate): natural obligation / needs_bill
-        # creation and their explicit status transitions, all M3-first. Inert
-        # unless gateway.pa_objects_gate.enabled is true; any failure returns None
-        # so ordinary conversation is never broken and no success is ever claimed.
-        if not is_internal and not _raw_capture_text.startswith("/"):
-            try:
-                from gateway.pa_objects import service as _pa_objects
-
-                _pa_object_response = await _pa_objects.intercept(event)
-            except Exception as _pa_object_exc:
-                logger.exception("PA object handling failed: %s", _pa_object_exc)
-                _pa_object_response = None
-            if _pa_object_response is not None:
-                return _pa_object_response
+        # Canonical PA objects (obligation / needs_bill) are NO LONGER created by
+        # a pre-model interceptor. Ordinary conversational speech ("I need to
+        # organise tickets for the Swans") must reach Christine's model so she can
+        # converse, ask natural follow-up questions and only record something once
+        # meaning is sufficiently clear. The bounded M3-first write now runs behind
+        # the model-callable ``pa_object`` tool (gateway/pa_objects/service.py:
+        # tool_create / tool_transition), so rules constrain the *action*, not the
+        # model's ability to reason. The former pre-model _pa_objects.intercept()
+        # gate is deliberately not wired here; the write pipeline it shared remains
+        # available to the tool. (Owner correction — Christine conversational PA.)
 
         # Bill-lane natural PA intake interprets ordinary language into a
         # closed set of typed actions, then lets bounded handlers mutate state.
