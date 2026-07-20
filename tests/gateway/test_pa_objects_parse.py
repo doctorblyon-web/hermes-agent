@@ -93,6 +93,26 @@ def test_resolve_requires_a_decision_body():
     assert parse.parse_transition("resolve that decision") is None
 
 
+def test_leading_address_is_stripped_not_part_of_wording():
+    c = parse.parse_create("Christine, I need to call the accountant")
+    assert c is not None and c.kind == "obligation"
+    assert c.wording == "call the accountant"          # "Christine," is address, not wording
+
+
+def test_point4_sentence_is_obligation_due_tomorrow_not_goals():
+    s = "Christine, I need to remember to organize a talk for the meeting tomorrow night"
+    c = parse.parse_create(s)
+    assert c is not None and c.kind == "obligation"
+    assert c.wording == "remember to organize a talk for the meeting tomorrow night"
+    assert c.due_date is not None                       # "tomorrow night" resolved to a date
+
+
+def test_trailing_day_expression_sets_due():
+    base = datetime(2026, 7, 20, 9, 0)                  # Monday
+    assert parse.parse_create("I need to draft the deck tomorrow", now=base).due_date == "2026-07-21"
+    assert parse.parse_create("I have to call Sam on Friday", now=base).due_date == "2026-07-24"
+
+
 def test_date_independent_of_host_zone():
     base = datetime(2026, 7, 20, 9, 0)   # a Monday
     d = parse.resolve_due_date("Friday", now=base)

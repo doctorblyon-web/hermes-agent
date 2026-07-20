@@ -91,7 +91,8 @@ def _confirm(kind: str, action: str, obj: dict) -> str:
     if action == "create" and kind == "obligation":
         msg = f"Recorded as an obligation: {_quote(wording)}."
         if obj.get("due_date"):
-            msg += f" Due {parse.human_date(obj['due_date'])}."
+            msg += (f" Due {parse.human_date(obj['due_date'])}."
+                    " Want me to set a reminder for it?")
         return msg
     if action == "create" and kind == "needs_bill":
         return f"Recorded as a decision for you to make: {_quote(wording)}."

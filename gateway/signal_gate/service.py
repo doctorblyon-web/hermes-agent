@@ -11,7 +11,7 @@ from zoneinfo import ZoneInfo
 
 from hermes_cli.config import load_config_readonly
 from hermes_constants import get_hermes_home
-from gateway.signal_gate import m3_client, schema
+from gateway.signal_gate import goals_mode, m3_client, schema
 from gateway.signal_gate.store import Store
 
 logger = logging.getLogger(__name__)
@@ -112,6 +112,88 @@ def _parse_today_goals(text):
     return goals
 
 
+# --- explicit Goals-mode entry (a small conversation-state gate) -------------
+
+# Explicit natural ways Bill opens Goals. Deliberately narrow: each names "goals"
+# (or "priorities") for "today". None of these match ordinary "I need to…",
+# "I've got to…", "I need to remember…" or "make sure I…" statements.
+_GOALS_INITIATION = re.compile(
+    r"^\s*(?:hey\s+|ok(?:ay)?\s+|so\s+)?(?:christine[,:]?\s*)?"
+    r"(?:"
+    r"(?:these|here)\s+are\s+my\s+(?:top\s+\w+\s+)?(?:goals|priorities)\s+for\s+today"
+    r"|my\s+(?:goals|priorities)\s+for\s+today\s+are"
+    r"|today'?s\s+(?:goals|priorities)\s+are"
+    r"|set\s+(?:my\s+|today'?s\s+)?(?:goals|priorities)(?:\s+for\s+today)?"
+    r"|let'?s\s+(?:do|set|sort\s+out)\s+(?:today'?s\s+)?(?:goals|priorities)(?:\s+for\s+today)?"
+    r"|let\s+us\s+(?:do|set)\s+(?:today'?s\s+)?(?:goals|priorities)"
+    r"|time\s+for\s+today'?s\s+(?:goals|priorities)"
+    r")"
+    r"(?P<rest>.*)\Z",
+    re.IGNORECASE | re.DOTALL,
+)
+
+# Messages that must NEVER be captured as goals, even while Goals mode is armed:
+# they belong to obligation / reminder / thought / Needs Bill / ordinary routing.
+_OTHER_INTENT = re.compile(
+    r"^\s*(?:hey\s+|ok(?:ay)?\s+|so\s+)?(?:christine[,:]?\s*)?"
+    r"(?:"
+    r"i\s+(?:need|have|must|ought|(?:'ve|ve|have)\s+got|got|gotta)\s+to\b"
+    r"|i\s+need\s+to\s+remember\b"
+    r"|make\s+sure\b"
+    r"|don'?t\s+let\s+me\b"
+    r"|remind\s+me\b"
+    r"|save\s+this\s+as\b"
+    r"|remember\s+(?:this|to)\b"
+    r"|i\s+need\s+to\s+decide\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def _looks_like_other_intent(text) -> bool:
+    return isinstance(text, str) and _OTHER_INTENT.match(text) is not None
+
+
+def _parse_goal_lines(text):
+    """Split a free block into 1..n goal strings, or return () if none.
+
+    Accepts newline-separated lines, or a single line of numbered / comma /
+    'and'-separated items. List markers are stripped; nothing is rewritten.
+    """
+    if not isinstance(text, str) or not text.strip():
+        return ()
+    body = text.strip()
+    lines = [ln for ln in body.splitlines() if ln.strip()]
+    if len(lines) <= 1:
+        single = lines[0] if lines else body
+        # numbered items on one line: "1) a 2) b 3) c"
+        parts = re.split(r"\s*\b\d+[.)]\s*", single)
+        parts = [p for p in parts if p.strip()]
+        if len(parts) <= 1:
+            parts = re.split(r"\s*,\s*|\s+and\s+", single)
+        lines = parts
+    goals = tuple(_LIST_MARKER.sub("", ln, count=1).strip() for ln in lines)
+    # A real goal has actual content — a stray "." or "-" is not a goal.
+    goals = tuple(g for g in goals if g and re.search(r"[0-9A-Za-z]", g))
+    return goals
+
+
+def _detect_initiation(text):
+    """Return ('inline', goals_tuple) | ('ask',) | None for a Goals opener."""
+    if not isinstance(text, str):
+        return None
+    m = _GOALS_INITIATION.match(text)
+    if not m:
+        return None
+    rest = (m.group("rest") or "")
+    rest = re.sub(r"^\s*(?:are|is|for\s+today|:|-|—|–)\s*", "", rest, flags=re.IGNORECASE)
+    rest = rest.strip().strip(".;,! ")   # a trailing full stop is not a goal
+    goals = _parse_goal_lines(rest)
+    if goals:
+        return ("inline", goals)
+    return ("ask",)
+
+
 def _today_has_goals():
     return _today_state()["has_goals"]
 
@@ -139,21 +221,52 @@ def _today_state():
 
 async def intercept_today_goals(event):
     """Handle the one exact Bill-lane command before model dispatch."""
-    goals = _parse_today_goals(getattr(event, "text", None))
-    if goals is None:
+    text = getattr(event, "text", None)
+    literal = _parse_today_goals(text)                    # "Set today's goals:" (unchanged)
+    initiation = _detect_initiation(text) if literal is None else None
+    source = getattr(event, "source", None)
+
+    # Nothing goals-shaped and no lane to check armed state against: fall through
+    # cheaply, exactly as before (ordinary conversation is never intercepted).
+    if literal is None and initiation is None and source is None:
         return None
+
     try:
         cfg = settings()
     except Exception:
+        if literal is None and initiation is None:
+            return None
         return "I couldn’t safely prepare today’s goals, so nothing was changed."
-    if not is_governed_lane(
-        event.source, {"gateway": {"signal_gate": cfg}}
-    ):
+    if not is_governed_lane(source, {"gateway": {"signal_gate": cfg}}):
         return None
+
+    armed = literal is None and initiation is None and goals_mode.is_armed(cfg, source)
+
+    # Explicit opener with no goals stated: ask once and arm the one-shot window.
+    if initiation is not None and initiation[0] == "ask":
+        goals_mode.arm(cfg, event.source)
+        return ("Sure — what are your top three goals for today? "
+                "Send one to three, one per line.")
+
+    goals = literal
+    if goals is None and initiation is not None:          # ("inline", goals)
+        goals = initiation[1]
+    if goals is None and armed:
+        # Christine has just asked for goals; this reply answers that question —
+        # unless it is really an obligation / reminder / thought / Needs Bill,
+        # which keeps its own routing (no goal is ever invented from it).
+        goals_mode.disarm(cfg, event.source)
+        if _looks_like_other_intent(text):
+            return None
+        goals = _parse_goal_lines(text)
+    if goals is None:
+        return None
+
     if not goals:
         return "Please send at least one goal, with one non-empty goal per line."
     if len(goals) > 3:
         return "Please choose your top three goals and resend them."
+    goals_mode.disarm(cfg, event.source)                  # Goals is now underway
     proposal = schema.Proposal(
         tuple({"text": goal, "mission": "billos"} for goal in goals),
         today_goals=True,

@@ -24,6 +24,16 @@ SYDNEY = ZoneInfo("Australia/Sydney")
 
 # --- creation recognition ----------------------------------------------------
 
+# An optional leading address ("Christine, …", "Hey Christine, …") is stripped
+# before recognition so it is treated as address, not part of the object wording.
+_ADDRESS = re.compile(
+    r"^\s*(?:hey\s+|ok(?:ay)?\s+|so\s+)?christine[,:]?\s+", re.IGNORECASE)
+
+
+def _strip_address(text: str) -> str:
+    return _ADDRESS.sub("", text, count=1) if isinstance(text, str) else text
+
+
 # "I need to / I have to / I must / I've got to / I ought to <body>"
 _CREATE_LEAD = re.compile(
     r"^\s*i\s+(?:need\s+to|have\s+to|must|ought\s+to|(?:'ve|ve|have)\s+got\s+to|got\s+to|gotta)\s+(?P<body>.+?)\s*$",
@@ -47,6 +57,16 @@ _DUE = re.compile(
     r"\b(?:by\s+the\s+end\s+of|by\s+end\s+of|by|before|due(?:\s+on|\s+by)?)\s+(?P<when>[^.,;]+?)\s*(?:[.,;]|$)",
     re.IGNORECASE,
 )
+# A bare trailing day expression ("… tomorrow night", "… this evening", "… on
+# Friday") also fixes a due date, even without a "by". Anchored at the end so it
+# does not grab a day mentioned mid-obligation.
+_DUE_TRAILING = re.compile(
+    r"\b(?:on\s+)?(?P<when>tomorrow|tonight|today|this\s+(?:evening|afternoon|morning)|"
+    r"next\s+(?:week|month|monday|tuesday|wednesday|thursday|friday|saturday|sunday)|"
+    r"(?:mon|tues|wednes|thurs|fri|satur|sun)day)"
+    r"(?:\s+(?:night|morning|evening|afternoon))?\s*[.!?]?\s*$",
+    re.IGNORECASE,
+)
 # A modest, explicit project phrase only.
 _PROJECT = re.compile(
     r"\bfor\s+the\s+(?P<project>[A-Za-z0-9][\w &'’-]{0,60}?)\s+project\b",
@@ -67,6 +87,7 @@ def parse_create(text: str, *, now: Optional[datetime] = None) -> Optional[Creat
     """Recognise an obligation or needs_bill creation, or return None."""
     if not isinstance(text, str):
         return None
+    text = _strip_address(text)
     m = _CREATE_LEAD.match(text)
     if not m:
         return None
@@ -95,6 +116,10 @@ def _first_due_date(body: str, *, now=None) -> Optional[str]:
         d = resolve_due_date(m.group("when").strip(), now=now)
         if d is not None:
             resolved = d
+    if resolved is None:
+        tm = _DUE_TRAILING.search(body)
+        if tm:
+            resolved = resolve_due_date(tm.group("when").strip(), now=now)
     return resolved.isoformat() if resolved else None
 
 
@@ -187,6 +212,7 @@ def parse_transition(text: str) -> Optional[Transition]:
     only clear, explicit commands transition an object."""
     if not isinstance(text, str) or not text.strip():
         return None
+    text = _strip_address(text)
 
     m = _RESOLVE.match(text)
     if m:
