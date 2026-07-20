@@ -4598,7 +4598,23 @@ class BasePlatformAdapter(ABC):
                     except Exception as exc:
                         logger.error("[%s] governed SIGNAL rejected: %s", self.name, exc)
                         _signal_rejected = True
-                        text_content = "The SIGNAL proposal was not delivered because deterministic validation failed. Nothing was saved or applied."
+                        # Do NOT swallow the whole reply. Strip only the malformed
+                        # SIGNAL envelope and keep whatever conversational content the
+                        # model wrote around it (a reflected obligation, a separate
+                        # request), so a bad envelope never discards the rest of the
+                        # message. Fall back to the plain notice only when nothing
+                        # else remains.
+                        try:
+                            _remainder = signal_gate.strip_signal_envelope(text_content)
+                        except Exception:
+                            _remainder = ""
+                        _signal_notice = (
+                            "I didn’t set that as a SIGNAL — the proposal didn’t pass "
+                            "deterministic validation, so nothing was saved or applied there."
+                        )
+                        text_content = (
+                            f"{_remainder}\n\n{_signal_notice}" if _remainder else _signal_notice
+                        )
                         images = []
                         local_files = []
                         media_files = []

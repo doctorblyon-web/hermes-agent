@@ -60,6 +60,36 @@ class GovernedError(RuntimeError):
     pass
 
 
+# A fenced ```signal … ``` block, plus the plain-text SIGNAL/goals boilerplate lines
+# that ``prepare`` treats as an envelope. Used only to salvage a reply when an envelope
+# fails validation, so the model's surrounding conversational content is never lost.
+_SIGNAL_BLOCK = re.compile(r"```signal\b.*?```", re.DOTALL | re.IGNORECASE)
+_SIGNAL_BOILERPLATE = re.compile(
+    r"(?im)^\s*(?:"
+    r"captured\.?\s*$"
+    r"|captured as (?:a proposal|today[’']?s goals proposal)\..*$"
+    r"|i[’']?ve prepared these as today[’']?s goals:\s*$"
+    r"|.*approve canonical application.*$"
+    r")"
+)
+
+
+def strip_signal_envelope(text: str) -> str:
+    """Return *text* with any SIGNAL/goals envelope fragments removed.
+
+    Removes the fenced ``signal`` block and the recognised SIGNAL boilerplate lines,
+    leaving whatever genuine conversational content the model wrote around them. A
+    malformed envelope must never discard that content (e.g. a reflected obligation or
+    a separate request in the same message). Returns "" if nothing else remains.
+    """
+    if not isinstance(text, str) or not text:
+        return ""
+    without_block = _SIGNAL_BLOCK.sub("", text)
+    without_boilerplate = _SIGNAL_BOILERPLATE.sub("", without_block)
+    # Collapse the blank lines the removals leave behind.
+    return re.sub(r"\n{3,}", "\n\n", without_boilerplate).strip()
+
+
 @dataclass(frozen=True)
 class Prepared:
     proposal_id: str
